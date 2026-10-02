@@ -40,6 +40,9 @@ CREATE INDEX IF NOT EXISTS idx_products_whop_product_id
 CREATE INDEX IF NOT EXISTS idx_products_whop_plan_id
   ON products (whop_plan_id)
   WHERE whop_plan_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_products_whop_product_plan
+  ON products (whop_product_id, whop_plan_id)
+  WHERE whop_product_id IS NOT NULL AND whop_plan_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_products_shoppex_product_id
   ON products (shoppex_product_id)
   WHERE shoppex_product_id IS NOT NULL;

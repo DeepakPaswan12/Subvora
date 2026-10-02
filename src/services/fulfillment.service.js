@@ -58,17 +58,25 @@ export async function fulfillOrder(productId, orderId) {
  * @returns {object|null}
  */
 export async function findSubvoraProduct({ whopProductId, whopPlanId }) {
+  if (!whopProductId && !whopPlanId) {
+    return null;
+  }
+
   let query = supabase
     .from('products')
     .select('id, name, active, whop_product_id, whop_plan_id')
     .eq('active', true);
 
-  if (whopPlanId) {
+  if (whopProductId && whopPlanId) {
+    // Both provided: enforce conceptual hierarchy
+    // Subvora product -> whop_product_id -> whop_plan_id
+    query = query
+      .eq('whop_product_id', whopProductId)
+      .eq('whop_plan_id', whopPlanId);
+  } else if (whopPlanId) {
     query = query.eq('whop_plan_id', whopPlanId);
   } else if (whopProductId) {
     query = query.eq('whop_product_id', whopProductId);
-  } else {
-    return null;
   }
 
   const { data, error } = await query.maybeSingle();

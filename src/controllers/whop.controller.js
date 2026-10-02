@@ -91,6 +91,16 @@ async function routeEvent(eventType, payload, eventRowId) {
 }
 
 /**
+ * Helper to safely extract an ID string whether Whop sends a raw string or an object with an `id` field.
+ */
+function extractIdentifier(val) {
+  if (!val) return null;
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'object' && typeof val.id === 'string') return val.id.trim();
+  return null;
+}
+
+/**
  * payment.succeeded
  *
  * Flow:
@@ -102,15 +112,15 @@ async function routeEvent(eventType, payload, eventRowId) {
 async function handlePaymentSucceeded(payload) {
   const data = payload.data || payload;
 
-  // Extract identifiers from the Whop payment payload
-  const whopPaymentId    = data.id         || data.payment_id    || null;
-  const whopMembershipId = data.membership || data.membership_id || null;
-  const whopProductId    = data.product    || data.product_id    || null;
-  const whopPlanId       = data.plan       || data.plan_id       || null;
-  const customerEmail    = data.email       || data.user_email   || null;
+  // Extract identifiers from the Whop payment payload safely
+  const whopPaymentId    = extractIdentifier(data.id)         || extractIdentifier(data.payment_id);
+  const whopMembershipId = extractIdentifier(data.membership) || extractIdentifier(data.membership_id);
+  const whopProductId    = extractIdentifier(data.product)    || extractIdentifier(data.product_id);
+  const whopPlanId       = extractIdentifier(data.plan)       || extractIdentifier(data.plan_id);
+  const customerEmail    = data.email || data.user_email || (typeof data.user === 'object' ? data.user?.email : null) || null;
 
   if (!whopProductId && !whopPlanId) {
-    logger.error({ payload: '(redacted)' }, 'payment.succeeded missing product/plan identifiers');
+    logger.error({ whopPaymentId }, 'payment.succeeded missing product/plan identifiers');
     throw new Error('Missing product/plan identifiers in payment.succeeded payload');
   }
 
@@ -128,7 +138,7 @@ async function handlePaymentSucceeded(payload) {
   if (!product) {
     logger.error(
       { whopProductId, whopPlanId },
-      'No matching active Subvora product found for Whop identifiers',
+      'No matching active Subvora product found for Whop identifiers. Map this Whop product and plan to a Subvora product in Supabase to fulfill.',
     );
     throw new Error('No matching Subvora product');
   }
@@ -171,10 +181,10 @@ async function handlePaymentFailed(payload) {
 async function handleMembershipActivated(payload) {
   const data = payload.data || payload;
 
-  const whopMembershipId = data.id         || data.membership_id || null;
-  const whopProductId    = data.product    || data.product_id    || null;
-  const whopPlanId       = data.plan       || data.plan_id       || null;
-  const customerEmail    = data.email       || data.user_email   || null;
+  const whopMembershipId = extractIdentifier(data.id)         || extractIdentifier(data.membership_id);
+  const whopProductId    = extractIdentifier(data.product)    || extractIdentifier(data.product_id);
+  const whopPlanId       = extractIdentifier(data.plan)       || extractIdentifier(data.plan_id);
+  const customerEmail    = data.email || data.user_email || (typeof data.user === 'object' ? data.user?.email : null) || null;
 
   if (!whopProductId && !whopPlanId) {
     logger.info({ whopMembershipId }, 'membership.activated without product — acknowledging');

@@ -512,3 +512,324 @@ describe('Error middleware', () => {
     expect(responseBody.error.message).not.toContain('supabase.js');
   });
 });
+
+// ════════════════════════════════════════════════════════
+//  Unit tests — Product mapping (findSubvoraProduct)
+// ════════════════════════════════════════════════════════
+
+describe('Product mapping — findSubvoraProduct', () => {
+  const mockProducts = [
+    {
+      id: 'subvora-uuid-pro',
+      name: 'Subvora Pro Plan',
+      whop_product_id: 'prod_subvora_pro',
+      whop_plan_id: 'plan_subvora_pro_monthly',
+      active: true,
+    },
+    {
+      id: 'subvora-uuid-legacy',
+      name: 'Subvora Legacy Plan',
+      whop_product_id: 'prod_subvora_legacy',
+      whop_plan_id: 'plan_subvora_legacy_monthly',
+      active: false,
+    },
+  ];
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
+    vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
+    vi.stubEnv('WHOP_API_KEY', 'whop_test');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
+    vi.stubEnv('NODE_ENV', 'test');
+
+    vi.doMock('../src/db/supabase.js', () => ({
+      supabase: {
+        from: (table) => {
+          if (table !== 'products') return {};
+          const filters = {};
+          const builder = {
+            select: () => builder,
+            eq: (col, val) => {
+              filters[col] = val;
+              return builder;
+            },
+            maybeSingle: async () => {
+              const match = mockProducts.find((p) => {
+                for (const [k, v] of Object.entries(filters)) {
+                  if (p[k] !== v) return false;
+                }
+                return true;
+              });
+              return { data: match || null, error: null };
+            },
+          };
+          return builder;
+        },
+      },
+    }));
+  });
+
+  it('should match product and plan when both match', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_subvora_pro',
+      whopPlanId: 'plan_subvora_pro_monthly',
+    });
+    expect(result).toBeDefined();
+    expect(result.id).toBe('subvora-uuid-pro');
+    expect(result.name).toBe('Subvora Pro Plan');
+  });
+
+  it('should return null for matching product but wrong plan', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_subvora_pro',
+      whopPlanId: 'plan_wrong_tier',
+    });
+    expect(result).toBeNull();
+  });
+
+  it('should return null for unknown product', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_unknown',
+      whopPlanId: 'plan_subvora_pro_monthly',
+    });
+    expect(result).toBeNull();
+  });
+
+  it('should return null for unknown plan', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopPlanId: 'plan_unknown_xyz',
+    });
+    expect(result).toBeNull();
+  });
+
+  it('should return null for inactive Subvora product even if IDs match', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_subvora_legacy',
+      whopPlanId: 'plan_subvora_legacy_monthly',
+    });
+    expect(result).toBeNull();
+  });
+});
+
+// ════════════════════════════════════════════════════════
+//  Unit tests — Whop webhook product mapping and fulfillment flows
+// ════════════════════════════════════════════════════════
+
+describe('Whop webhook product mapping and fulfillment flows', () => {
+  const TEST_SECRET = 'ws_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
+    vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
+    vi.stubEnv('WHOP_API_KEY', 'whop_test');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', TEST_SECRET);
+    vi.stubEnv('NODE_ENV', 'test');
+  });
+
+  function createMockRes() {
+    let statusCode = 200;
+    let body = null;
+    const res = {
+      status: (code) => {
+        statusCode = code;
+        return res;
+      },
+      json: (data) => {
+        body = data;
+        return res;
+      },
+      getStatusCode: () => statusCode,
+      getBody: () => body,
+    };
+    return res;
+  }
+
+  it('should acknowledge duplicate webhook without re-fulfilling', async () => {
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve({ id: 'evt_existing', processed: true }),
+      recordEvent: vi.fn(),
+      markEventProcessed: vi.fn(),
+    }));
+
+    const { handleWhopWebhook } = await import('../src/controllers/whop.controller.js');
+
+    const rawBody = JSON.stringify({
+      id: 'evt_dup123',
+      type: 'payment.succeeded',
+      data: { id: 'pay_123', product: 'prod_test', plan: 'plan_test' },
+    });
+    const headers = signWebhook(rawBody, TEST_SECRET, 'evt_dup123');
+
+    const res = createMockRes();
+    await handleWhopWebhook({ rawBody, headers }, res);
+
+    expect(res.getStatusCode()).toBe(200);
+    expect(res.getBody()).toEqual({
+      success: true,
+      data: { message: 'Already processed' },
+    });
+  });
+
+  it('should fail safely and return 500 when product is unmapped (retryable)', async () => {
+    let markProcessedCalled = false;
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: 'evt_row_1' }),
+      markEventProcessed: () => {
+        markProcessedCalled = true;
+        return Promise.resolve();
+      },
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProduct: () => Promise.resolve(null),
+      fulfillOrder: vi.fn(),
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      createOrder: vi.fn(),
+      findOrderByWhopPaymentId: () => Promise.resolve(null),
+    }));
+
+    const { handleWhopWebhook } = await import('../src/controllers/whop.controller.js');
+
+    const rawBody = JSON.stringify({
+      id: 'evt_unmapped_123',
+      type: 'payment.succeeded',
+      data: { id: 'pay_456', product: 'prod_unrelated', plan: 'plan_unknown' },
+    });
+    const headers = signWebhook(rawBody, TEST_SECRET, 'evt_unmapped_123');
+
+    const res = createMockRes();
+    await handleWhopWebhook({ rawBody, headers }, res);
+
+    expect(res.getStatusCode()).toBe(500);
+    expect(res.getBody()).toEqual({
+      success: false,
+      error: { code: 'PROCESSING_FAILED', message: 'Webhook processing failed' },
+    });
+    // Crucial: event must NOT be marked processed so Whop can retry it later
+    expect(markProcessedCalled).toBe(false);
+  });
+
+  it('should fail safely and return 500 when product matches but plan is wrong', async () => {
+    let markProcessedCalled = false;
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: 'evt_row_2' }),
+      markEventProcessed: () => {
+        markProcessedCalled = true;
+        return Promise.resolve();
+      },
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProduct: () => Promise.resolve(null),
+      fulfillOrder: vi.fn(),
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      createOrder: vi.fn(),
+      findOrderByWhopPaymentId: () => Promise.resolve(null),
+    }));
+
+    const { handleWhopWebhook } = await import('../src/controllers/whop.controller.js');
+
+    const rawBody = JSON.stringify({
+      id: 'evt_wrongplan_123',
+      type: 'payment.succeeded',
+      data: { id: 'pay_789', product: 'prod_subvora_pro', plan: 'plan_wrong_tier' },
+    });
+    const headers = signWebhook(rawBody, TEST_SECRET, 'evt_wrongplan_123');
+
+    const res = createMockRes();
+    await handleWhopWebhook({ rawBody, headers }, res);
+
+    expect(res.getStatusCode()).toBe(500);
+    expect(res.getBody().success).toBe(false);
+    expect(markProcessedCalled).toBe(false);
+  });
+
+  it('should successfully fulfill order after mapping', async () => {
+    let markProcessedCalled = false;
+    let orderCreated = false;
+    let fulfillmentCalled = false;
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: 'evt_row_success' }),
+      markEventProcessed: () => {
+        markProcessedCalled = true;
+        return Promise.resolve();
+      },
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProduct: ({ whopProductId, whopPlanId }) => {
+        if (whopProductId === 'prod_subvora_pro' && whopPlanId === 'plan_subvora_pro_monthly') {
+          return Promise.resolve({
+            id: 'subvora-uuid-pro',
+            name: 'Subvora Pro Plan',
+            active: true,
+          });
+        }
+        return Promise.resolve(null);
+      },
+      fulfillOrder: (_productId, _orderId) => {
+        fulfillmentCalled = true;
+        return Promise.resolve({ success: true, inventoryId: 'inv-uuid-1' });
+      },
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByWhopPaymentId: () => Promise.resolve(null),
+      createOrder: ({ productId, customerEmail, whopPaymentId }) => {
+        orderCreated = true;
+        return Promise.resolve({
+          id: 'order-uuid-1',
+          product_id: productId,
+          customer_email: customerEmail,
+          whop_payment_id: whopPaymentId,
+          status: 'paid',
+          fulfillment_status: 'pending',
+        });
+      },
+    }));
+
+    const { handleWhopWebhook } = await import('../src/controllers/whop.controller.js');
+
+    const rawBody = JSON.stringify({
+      id: 'evt_success_123',
+      type: 'payment.succeeded',
+      data: {
+        id: 'pay_success_123',
+        product: 'prod_subvora_pro',
+        plan: 'plan_subvora_pro_monthly',
+        email: 'customer@example.com',
+      },
+    });
+    const headers = signWebhook(rawBody, TEST_SECRET, 'evt_success_123');
+
+    const res = createMockRes();
+    await handleWhopWebhook({ rawBody, headers }, res);
+
+    expect(res.getStatusCode()).toBe(200);
+    expect(res.getBody()).toEqual({
+      success: true,
+      data: { message: 'Processed' },
+    });
+    expect(orderCreated).toBe(true);
+    expect(fulfillmentCalled).toBe(true);
+    expect(markProcessedCalled).toBe(true);
+  });
+});
+

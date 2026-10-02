@@ -208,28 +208,68 @@ In your Render dashboard, add these env vars:
 Since no public admin API exists (by design), add inventory through the
 **Supabase dashboard** SQL Editor:
 
+### Product Mapping Architecture
+
+```
+Subvora Product (UUID, name)
+       ↓
+whop_product_id (e.g. prod_xxxxxxxxxxxxx)
+       ↓
+whop_plan_id    (e.g. plan_xxxxxxxxxxxxx)
+```
+
+### Method A: Using Supabase SQL Editor (Recommended)
+
+Execute [`supabase/seed.sql`](supabase/seed.sql) in your Supabase SQL Editor:
+
 ```sql
--- 1. First, ensure your product exists
-INSERT INTO products (name, description, whop_product_id, whop_plan_id, active)
-VALUES (
-  'My Digital Product',
-  'Description here',
-  'prod_XXXXXXXX',   -- from your Whop dashboard
-  'plan_XXXXXXXX',   -- from your Whop dashboard
+-- 1. Create the Subvora product mapped to Whop product & plan IDs
+INSERT INTO products (
+  id,
+  name,
+  description,
+  whop_product_id,
+  whop_plan_id,
+  active
+) VALUES (
+  '11111111-1111-1111-1111-111111111111',
+  'Subvora Pro Digital Access',
+  'Instant digital license access to Subvora Pro features',
+  'prod_YOUR_REAL_WHOP_PRODUCT_ID',
+  'plan_YOUR_REAL_WHOP_PLAN_ID',
   true
 );
 
 -- 2. Add inventory items (one per entitlement)
 INSERT INTO inventory (product_id, entitlement_value, status)
 VALUES
-  ((SELECT id FROM products WHERE name = 'My Digital Product'), 'LICENSE-KEY-001', 'available'),
-  ((SELECT id FROM products WHERE name = 'My Digital Product'), 'LICENSE-KEY-002', 'available'),
-  ((SELECT id FROM products WHERE name = 'My Digital Product'), 'LICENSE-KEY-003', 'available');
+  ('11111111-1111-1111-1111-111111111111', 'LICENSE-KEY-001', 'available'),
+  ('11111111-1111-1111-1111-111111111111', 'LICENSE-KEY-002', 'available'),
+  ('11111111-1111-1111-1111-111111111111', 'LICENSE-KEY-003', 'available');
+```
+
+### Method B: Using the Local Admin CLI
+
+Run locally without exposing any public HTTP endpoints:
+
+```bash
+# List all products and inventory counts
+npm run manage:products list
+
+# Create a new product and map Whop IDs
+npm run manage:products create "Subvora Pro" "prod_YOUR_REAL_WHOP_PRODUCT_ID" "plan_YOUR_REAL_WHOP_PLAN_ID"
+
+# Map an existing product by UUID
+npm run manage:products map "11111111-1111-1111-1111-111111111111" "prod_YOUR_REAL_WHOP_PRODUCT_ID" "plan_YOUR_REAL_WHOP_PLAN_ID"
+
+# Add inventory items for fulfillment
+npm run manage:products add-inventory "11111111-1111-1111-1111-111111111111" "KEY-001" "KEY-002"
 ```
 
 > 🔒 **Important:** Only add products/entitlements that you are authorized to
 > distribute. The `whop_product_id` and `whop_plan_id` must match products you
-> own in your Whop seller account.
+> own in your Whop seller account. Do NOT use Whop test product IDs (e.g. Ceramic Coating Package)
+> for your real Subvora products.
 
 ---
 
