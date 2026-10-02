@@ -136,6 +136,27 @@ ON CONFLICT (id) DO UPDATE SET
   active             = EXCLUDED.active,
   updated_at         = now();
 
+-- 5. CapCut Pro — 1 Month (Shoppex Dynamic Product)
+INSERT INTO products (
+  id,
+  name,
+  description,
+  shoppex_product_id,
+  active
+) VALUES (
+  '20e6b592-d3ee-4c89-a38b-cfd262548331',
+  'CapCut Pro — 1 Month',
+  'CapCut Pro subscription - 1 Month access',
+  '01a0fce5-de64-77a3-98d2-9b8c13b353bd',
+  true
+)
+ON CONFLICT (id) DO UPDATE SET
+  name               = EXCLUDED.name,
+  description        = EXCLUDED.description,
+  shoppex_product_id = EXCLUDED.shoppex_product_id,
+  active             = EXCLUDED.active,
+  updated_at         = now();
+
 
 -- ────────────────────────────────────────────────────────────────────
 --  STEP 2: Inventory Fulfillment (Kept Unseeded Until Ready)
