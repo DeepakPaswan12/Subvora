@@ -833,3 +833,248 @@ describe('Whop webhook product mapping and fulfillment flows', () => {
   });
 });
 
+// ════════════════════════════════════════════════════════
+//  Integration / Unit tests — 4 Active Whop Products & Plans
+// ════════════════════════════════════════════════════════
+
+describe('Whop 4 Products & Plans Mapping & Resolution', () => {
+  const TEST_SECRET = 'ws_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+  const ACTIVE_WHOP_PRODUCTS = [
+    {
+      id: '00000000-0000-4000-8000-000000000001',
+      name: 'Subvora Starter',
+      description: 'Subvora Starter tier - $3.49',
+      shoppex_product_id: 'subvora_starter',
+      whop_product_id: 'prod_OTOTDxKpSqZOS',
+      whop_plan_id: 'plan_GEhcPieUbPiEV',
+      active: true,
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000002',
+      name: 'Subvora Plus',
+      description: 'Subvora Plus tier - $5.99',
+      shoppex_product_id: 'subvora_plus',
+      whop_product_id: 'prod_vigxWiRlCDG1r',
+      whop_plan_id: 'plan_NPGtYYgSweOe5',
+      active: true,
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000003',
+      name: 'Subvora Premium',
+      description: 'Subvora Premium tier - $8.49',
+      shoppex_product_id: 'subvora_premium',
+      whop_product_id: 'prod_Z6Zt4PeOl32lo',
+      whop_plan_id: 'plan_YPYR0Ad2RL7wZ',
+      active: true,
+    },
+    {
+      id: '00000000-0000-4000-8000-000000000004',
+      name: 'Subvora Ultimate',
+      description: 'Subvora Ultimate tier - $12.99',
+      shoppex_product_id: 'subvora_ultimate',
+      whop_product_id: 'prod_jNuggU8L82qss',
+      whop_plan_id: 'plan_0r94rZzOKp6p8',
+      active: true,
+    },
+  ];
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock('../src/services/fulfillment.service.js');
+    vi.doUnmock('../src/services/order.service.js');
+    vi.doUnmock('../src/utils/idempotency.js');
+    vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
+    vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
+    vi.stubEnv('WHOP_API_KEY', 'whop_test');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', TEST_SECRET);
+    vi.stubEnv('NODE_ENV', 'test');
+
+    vi.doMock('../src/db/supabase.js', () => ({
+      supabase: {
+        from: (table) => {
+          if (table === 'products') {
+            const filters = {};
+            const builder = {
+              select: () => builder,
+              eq: (col, val) => {
+                filters[col] = val;
+                return builder;
+              },
+              maybeSingle: async () => {
+                const match = ACTIVE_WHOP_PRODUCTS.find((p) => {
+                  for (const [k, v] of Object.entries(filters)) {
+                    if (p[k] !== v) return false;
+                  }
+                  return true;
+                });
+                return { data: match || null, error: null };
+              },
+            };
+            return builder;
+          }
+          return {};
+        },
+      },
+    }));
+  });
+
+  it('should resolve Subvora Starter by product ID and plan ID', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_OTOTDxKpSqZOS',
+      whopPlanId: 'plan_GEhcPieUbPiEV',
+    });
+    expect(result).toBeDefined();
+    expect(result.id).toBe('00000000-0000-4000-8000-000000000001');
+    expect(result.name).toBe('Subvora Starter');
+  });
+
+  it('should resolve Subvora Plus by product ID and plan ID', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_vigxWiRlCDG1r',
+      whopPlanId: 'plan_NPGtYYgSweOe5',
+    });
+    expect(result).toBeDefined();
+    expect(result.id).toBe('00000000-0000-4000-8000-000000000002');
+    expect(result.name).toBe('Subvora Plus');
+  });
+
+  it('should resolve Subvora Premium by product ID and plan ID', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_Z6Zt4PeOl32lo',
+      whopPlanId: 'plan_YPYR0Ad2RL7wZ',
+    });
+    expect(result).toBeDefined();
+    expect(result.id).toBe('00000000-0000-4000-8000-000000000003');
+    expect(result.name).toBe('Subvora Premium');
+  });
+
+  it('should resolve Subvora Ultimate by product ID and plan ID', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_jNuggU8L82qss',
+      whopPlanId: 'plan_0r94rZzOKp6p8',
+    });
+    expect(result).toBeDefined();
+    expect(result.id).toBe('00000000-0000-4000-8000-000000000004');
+    expect(result.name).toBe('Subvora Ultimate');
+  });
+
+  it('should reject mismatched plan for Subvora Starter', async () => {
+    const { findSubvoraProduct } = await import('../src/services/fulfillment.service.js');
+    const result = await findSubvoraProduct({
+      whopProductId: 'prod_OTOTDxKpSqZOS',
+      whopPlanId: 'plan_NPGtYYgSweOe5', // Plus plan
+    });
+    expect(result).toBeNull();
+  });
+
+  it.each([
+    {
+      title: 'Subvora Starter',
+      whopProductId: 'prod_OTOTDxKpSqZOS',
+      whopPlanId: 'plan_GEhcPieUbPiEV',
+      expectedSubvoraId: '00000000-0000-4000-8000-000000000001',
+    },
+    {
+      title: 'Subvora Plus',
+      whopProductId: 'prod_vigxWiRlCDG1r',
+      whopPlanId: 'plan_NPGtYYgSweOe5',
+      expectedSubvoraId: '00000000-0000-4000-8000-000000000002',
+    },
+    {
+      title: 'Subvora Premium',
+      whopProductId: 'prod_Z6Zt4PeOl32lo',
+      whopPlanId: 'plan_YPYR0Ad2RL7wZ',
+      expectedSubvoraId: '00000000-0000-4000-8000-000000000003',
+    },
+    {
+      title: 'Subvora Ultimate',
+      whopProductId: 'prod_jNuggU8L82qss',
+      whopPlanId: 'plan_0r94rZzOKp6p8',
+      expectedSubvoraId: '00000000-0000-4000-8000-000000000004',
+    },
+  ])('payment.succeeded resolves $title ($whopPlanId) to Subvora product $expectedSubvoraId', async ({ whopProductId, whopPlanId, expectedSubvoraId }) => {
+    let capturedOrderId = null;
+    let capturedProductId = null;
+    let markProcessedCalled = false;
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: `evt_row_${whopPlanId}` }),
+      markEventProcessed: () => {
+        markProcessedCalled = true;
+        return Promise.resolve();
+      },
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProduct: ({ whopProductId: pId, whopPlanId: plId }) => {
+        const match = ACTIVE_WHOP_PRODUCTS.find(
+          (p) => p.whop_product_id === pId && p.whop_plan_id === plId,
+        );
+        return Promise.resolve(match || null);
+      },
+      fulfillOrder: () => {
+        // Real inventory fulfillment is NOT enabled yet
+        return Promise.resolve({ success: false });
+      },
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByWhopPaymentId: () => Promise.resolve(null),
+      createOrder: ({ productId, customerEmail, whopPaymentId }) => {
+        capturedProductId = productId;
+        capturedOrderId = `order_${whopPlanId}`;
+        return Promise.resolve({
+          id: capturedOrderId,
+          product_id: productId,
+          customer_email: customerEmail,
+          whop_payment_id: whopPaymentId,
+          status: 'paid',
+          fulfillment_status: 'pending',
+        });
+      },
+    }));
+
+    const { handleWhopWebhook } = await import('../src/controllers/whop.controller.js');
+
+    const rawBody = JSON.stringify({
+      id: `evt_pay_${whopPlanId}`,
+      type: 'payment.succeeded',
+      data: {
+        id: `pay_${whopPlanId}`,
+        product: whopProductId,
+        plan: whopPlanId,
+        email: 'customer@subvora.com',
+      },
+    });
+    const headers = signWebhook(rawBody, TEST_SECRET, `evt_pay_${whopPlanId}`);
+
+    let statusCode = 200;
+    let responseBody = null;
+    const res = {
+      status: (code) => {
+        statusCode = code;
+        return res;
+      },
+      json: (data) => {
+        responseBody = data;
+        return res;
+      },
+    };
+
+    await handleWhopWebhook({ rawBody, headers }, res);
+
+    expect(statusCode).toBe(200);
+    expect(responseBody).toEqual({ success: true, data: { message: 'Processed' } });
+    expect(capturedProductId).toBe(expectedSubvoraId);
+    expect(capturedOrderId).toBe(`order_${whopPlanId}`);
+    expect(markProcessedCalled).toBe(true);
+  });
+});
+
+

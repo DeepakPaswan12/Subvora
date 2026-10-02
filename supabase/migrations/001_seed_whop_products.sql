@@ -1,32 +1,17 @@
 -- ════════════════════════════════════════════════════════════════════
---  Subvora Backend — Product Mapping & Inventory Seed
+--  Migration: 001_seed_whop_products.sql
+--  Adds the 4 Subvora Whop products and plan mappings.
 --
---  Run this in your Supabase SQL Editor:
---    Supabase Dashboard → Project → SQL Editor → New Query
---
---  Conceptual Mapping Architecture:
---    Subvora product (UUID, name)
---        ↓
---    whop_product_id (e.g. prod_xxxxxxxxxxxxx)
---        ↓
---    whop_plan_id    (e.g. plan_xxxxxxxxxxxxx)
---
---  Active Whop Products & Plans:
---    1. Subvora Starter  ($3.49)  -> prod_OTOTDxKpSqZOS / plan_GEhcPieUbPiEV
---    2. Subvora Plus     ($5.99)  -> prod_vigxWiRlCDG1r / plan_NPGtYYgSweOe5
---    3. Subvora Premium  ($8.49)  -> prod_Z6Zt4PeOl32lo / plan_YPYR0Ad2RL7wZ
---    4. Subvora Ultimate ($12.99) -> prod_jNuggU8L82qss / plan_0r94rZzOKp6p8
+--  1. Subvora Starter ($3.49)  -> prod_OTOTDxKpSqZOS / plan_GEhcPieUbPiEV
+--  2. Subvora Plus ($5.99)     -> prod_vigxWiRlCDG1r / plan_NPGtYYgSweOe5
+--  3. Subvora Premium ($8.49)  -> prod_Z6Zt4PeOl32lo / plan_YPYR0Ad2RL7wZ
+--  4. Subvora Ultimate ($12.99)-> prod_jNuggU8L82qss / plan_0r94rZzOKp6p8
 -- ════════════════════════════════════════════════════════════════════
 
--- Ensure unique constraint on active (whop_product_id, whop_plan_id) pairs
+-- Ensure composite unique index exists on (whop_product_id, whop_plan_id)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_products_whop_product_plan_unique
   ON products (whop_product_id, whop_plan_id)
   WHERE whop_product_id IS NOT NULL AND whop_plan_id IS NOT NULL;
-
-
--- ────────────────────────────────────────────────────────────────────
---  STEP 1: Seed the 4 Subvora Products mapped to Whop Products & Plans
--- ────────────────────────────────────────────────────────────────────
 
 -- 1. Subvora Starter
 INSERT INTO products (
@@ -136,35 +121,8 @@ ON CONFLICT (id) DO UPDATE SET
   active             = EXCLUDED.active,
   updated_at         = now();
 
-
--- ────────────────────────────────────────────────────────────────────
---  STEP 2: Inventory Fulfillment (Kept Unseeded Until Ready)
--- ────────────────────────────────────────────────────────────────────
--- NOTE: Real inventory fulfillment is NOT enabled yet.
--- When you are ready to distribute digital license keys / entitlements,
--- insert them here. Example:
-/*
-INSERT INTO inventory (product_id, entitlement_value, status) VALUES
-  ('00000000-0000-4000-8000-000000000001', 'STARTER-KEY-1', 'available'),
-  ('00000000-0000-4000-8000-000000000002', 'PLUS-KEY-1', 'available'),
-  ('00000000-0000-4000-8000-000000000003', 'PREMIUM-KEY-1', 'available'),
-  ('00000000-0000-4000-8000-000000000004', 'ULTIMATE-KEY-1', 'available');
-*/
-
-
--- ────────────────────────────────────────────────────────────────────
---  STEP 3: Verify Your Setup
--- ────────────────────────────────────────────────────────────────────
-SELECT 
-  p.id AS subvora_product_id,
-  p.name AS product_name,
-  p.shoppex_product_id,
-  p.whop_product_id,
-  p.whop_plan_id,
-  p.active,
-  COUNT(i.id) FILTER (WHERE i.status = 'available') AS available_inventory_count
-FROM products p
-LEFT JOIN inventory i ON i.product_id = p.id
-WHERE p.active = true
-GROUP BY p.id, p.name, p.shoppex_product_id, p.whop_product_id, p.whop_plan_id, p.active
-ORDER BY p.name ASC;
+-- Deactivate old placeholder product if present
+UPDATE products
+   SET active = false
+ WHERE id = '11111111-1111-1111-1111-111111111111'
+   AND whop_product_id = 'prod_REAL_WHOP_PRODUCT_ID';
