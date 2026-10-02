@@ -128,3 +128,25 @@ export async function getAvailableCount(productId) {
 
   return count || 0;
 }
+
+/**
+ * Retrieve the inventory item assigned to an order (for idempotent duplicate delivery).
+ *
+ * @param {string} orderId
+ * @returns {Promise<{ id: string, entitlement_value: string, status: string } | null>}
+ */
+export async function getInventoryByOrderId(orderId) {
+  const { data, error } = await supabase
+    .from('inventory')
+    .select('id, entitlement_value, status')
+    .eq('order_id', orderId)
+    .in('status', ['reserved', 'delivered'])
+    .maybeSingle();
+
+  if (error) {
+    logger.error({ err: error, orderId }, 'Failed to look up inventory by order ID');
+    throw error;
+  }
+
+  return data;
+}

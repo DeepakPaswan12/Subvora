@@ -1,116 +1,236 @@
+import crypto from 'node:crypto';
 import { logger } from '../utils/logger.js';
 import { env } from '../config/env.js';
 
 // ════════════════════════════════════════════════════════
-//  Shoppex Dynamic Webhook Service — ADAPTER / PLACEHOLDER
+//  Shoppex Dynamic Product Delivery Service
 //
-//  Shoppex "Dynamic Product" webhooks are called after payment
-//  and must return the content the buyer receives.
+//  Authoritative documentation:
+//  https://docs.shoppex.io/developers/dynamic-delivery.md
 //
-//  ⚠️  The exact request payload schema and expected response
-//      format have NOT been officially confirmed.  Every
-//      section below that requires Shoppex-specific detail is
-//      marked with a TODO.
-//
-//  Once the official Shoppex documentation is available:
-//    1. Update verifyShoppexSignature() with the real algorithm.
-//    2. Update parseShoppexPayload() with the real field names.
-//    3. Update formatShoppexResponse() with the real response shape.
-//    4. Add Zod schemas for request validation.
+//  DYNAMIC products use `dynamic_webhook` as a direct server-to-server
+//  fulfillment callback after a paid invoice.
 // ════════════════════════════════════════════════════════
 
 /**
- * Verify the incoming Shoppex webhook signature.
+ * Verify incoming Shoppex Dynamic Delivery signature.
  *
- * TODO: Replace with the real verification algorithm from
- *       the official Shoppex documentation.
+ * Official spec from Shoppex docs:
+ *   - Header: X-Shoppex-Signature-V2
+ *   - Format: "v1,t=<timestamp>,h=<64_hex_sha256>"
+ *   - Canonical string: "${deliveryId}.${timestamp}.${rawBody}"
+ *   - Signed with: product's dynamic_webhook_secret (or fallback SHOPPEX_WEBHOOK_SECRET)
+ *   - Replay protection: ±300 seconds (5 minutes)
  *
- * Possible approaches (unknown until docs arrive):
- *   - HMAC-SHA256 of raw body with SHOPPEX_WEBHOOK_SECRET
- *   - RSA signature verification
- *   - Shared-secret header comparison
- *
- * @param {string|Buffer} rawBody
- * @param {object} headers
- * @returns {boolean}
+ * @param {object|string|Buffer} rawBodyOrParams
+ * @param {object} [headersArg]
+ * @param {string} [secretArg]
+ * @returns {{ valid: boolean, code?: string, message?: string }}
  */
-export function verifyShoppexSignature(rawBody, headers) {
-  if (!env.SHOPPEX_WEBHOOK_SECRET) {
-    logger.warn('Shoppex webhook secret not configured — skipping verification');
-    return false;
+export function verifyShoppexSignature(rawBodyOrParams, headersArg = {}, secretArg = null) {
+  let rawBody;
+  let headers;
+  let secret;
+
+  if (
+    rawBodyOrParams
+    && typeof rawBodyOrParams === 'object'
+    && !Buffer.isBuffer(rawBodyOrParams)
+    && ('rawBody' in rawBodyOrParams || 'headers' in rawBodyOrParams)
+  ) {
+    rawBody = rawBodyOrParams.rawBody;
+    headers = rawBodyOrParams.headers || {};
+    secret = rawBodyOrParams.secret || env.SHOPPEX_DYNAMIC_WEBHOOK_SECRET || env.SHOPPEX_WEBHOOK_SECRET;
+  } else {
+    rawBody = rawBodyOrParams;
+    headers = headersArg || {};
+    secret = secretArg || env.SHOPPEX_DYNAMIC_WEBHOOK_SECRET || env.SHOPPEX_WEBHOOK_SECRET;
+  }
+  if (!secret) {
+    logger.warn('Shoppex dynamic webhook secret is not configured in environment');
+    return { valid: false, code: 'SECRET_NOT_CONFIGURED', message: 'Secret not configured' };
   }
 
-  // TODO: Implement actual signature verification.
-  // Example placeholder (HMAC-SHA256 — may not match real spec):
-  //
-  // import crypto from 'node:crypto';
-  // const expected = crypto
-  //   .createHmac('sha256', env.SHOPPEX_WEBHOOK_SECRET)
-  //   .update(rawBody)
-  //   .digest('hex');
-  // const provided = headers['x-shoppex-signature']; // TODO: real header name
-  // return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(provided));
+  // Normalize header names (Express headers are lowercase)
+  const signatureHeader = headers['x-shoppex-signature-v2'] || headers['x-shoppex-signature'];
+  const deliveryId = headers['x-shoppex-delivery-id'] || headers['x-shoppex-idempotency-key'] || headers['x-shoppex-delivery'];
+  const timestampHeader = headers['x-shoppex-timestamp'];
 
-  logger.warn('Shoppex signature verification is a placeholder — NOT production-ready');
-  return false;
+  if (!signatureHeader || !deliveryId || !timestampHeader) {
+    logger.warn('Shoppex request missing required headers for signature verification');
+    return { valid: false, code: 'MISSING_HEADERS', message: 'Missing required signature headers' };
+  }
+
+  const rawBodyStr = typeof rawBody === 'string' ? rawBody : (rawBody ? rawBody.toString('utf-8') : '');
+
+  const segments = signatureHeader.split(',').map((part) => part.trim());
+  const parts = Object.fromEntries(
+    segments
+      .filter((part) => part.includes('='))
+      .map((part) => {
+        const [key, ...rest] = part.trim().split('=');
+        return [key, rest.join('=')];
+      }),
+  );
+
+  // Must include 'v1' scheme and matching timestamp
+  if (!segments.includes('v1') || parts.t !== String(timestampHeader)) {
+    logger.warn('Shoppex signature header structure invalid or timestamp mismatch');
+    return { valid: false, code: 'INVALID_SIGNATURE_HEADER', message: 'Invalid signature header structure' };
+  }
+
+  const timestamp = Number(parts.t);
+  if (!Number.isFinite(timestamp)) {
+    return { valid: false, code: 'INVALID_TIMESTAMP', message: 'Non-numeric timestamp' };
+  }
+
+  // Replay guard: 5 minutes (300 seconds)
+  const now = Math.floor(Date.now() / 1000);
+  if (Math.abs(now - timestamp) > 300) {
+    logger.warn({ timestamp, now }, 'Shoppex request timestamp outside 5-minute window');
+    return { valid: false, code: 'TIMESTAMP_OUT_OF_TOLERANCE', message: 'Webhook timestamp expired or in the future' };
+  }
+
+  // Hash must be 64-char hex string
+  if (!/^[0-9a-f]{64}$/i.test(parts.h ?? '')) {
+    return { valid: false, code: 'INVALID_HASH_FORMAT', message: 'Invalid hash format' };
+  }
+
+  const expectedSignature = crypto
+    .createHmac('sha256', secret)
+    .update(`${deliveryId}.${timestamp}.${rawBodyStr}`)
+    .digest('hex');
+
+  let matches = false;
+  try {
+    matches = crypto.timingSafeEqual(
+      Buffer.from(parts.h, 'hex'),
+      Buffer.from(expectedSignature, 'hex'),
+    );
+  } catch {
+    matches = false;
+  }
+
+  if (!matches) {
+    logger.warn('Shoppex webhook signature verification failed (digest mismatch)');
+    return { valid: false, code: 'SIGNATURE_MISMATCH', message: 'Signature mismatch' };
+  }
+
+  return { valid: true };
 }
 
 /**
- * Parse and validate the incoming Shoppex webhook payload.
+ * Parse and validate the incoming Shoppex dynamic delivery payload.
  *
- * TODO: Replace field names with the official Shoppex schema.
+ * Official spec: Shoppex sends both camelCase and snake_case representations
+ * for seamless interop.
  *
- * @param {object} body — parsed JSON body
+ * @param {object} body
+ * @param {object} [headers={}]
  * @returns {object} normalized payload
  */
-export function parseShoppexPayload(body) {
-  // TODO: Define a Zod schema once the Shoppex request format is known.
-  //
-  // Expected fields (UNKNOWN — these are guesses):
-  //   - order_id or transaction_id
-  //   - product_id or item_id
-  //   - customer_email
-  //   - quantity
-  //
-  // const shoppexSchema = z.object({ ... });
-  // return shoppexSchema.parse(body);
+export function parseShoppexPayload(body = {}, headers = {}) {
+  if (!body || typeof body !== 'object') {
+    throw new Error('Malformed or empty JSON body');
+  }
 
-  logger.warn('Shoppex payload parsing uses unverified placeholder fields');
+  const deliveryId = String(
+    headers['x-shoppex-delivery-id']
+      ?? headers['x-shoppex-idempotency-key']
+      ?? body.deliveryId
+      ?? body.delivery_id
+      ?? body.idempotencyKey
+      ?? body.idempotency_key
+      ?? body.invoiceId
+      ?? body.invoice_id
+      ?? '',
+  ).trim();
+
+  const idempotencyKey = String(
+    headers['x-shoppex-idempotency-key']
+      ?? headers['x-shoppex-delivery-id']
+      ?? body.idempotencyKey
+      ?? body.idempotency_key
+      ?? deliveryId,
+  ).trim();
+
+  const invoiceId = String(
+    body.invoiceId
+      ?? body.invoice_id
+      ?? body.invoice?.uniqid
+      ?? body.invoice?.id
+      ?? idempotencyKey,
+  ).trim();
+
+  const productId = String(
+    body.productId
+      ?? body.product_id
+      ?? body.product?.uniqid
+      ?? body.product?.id
+      ?? body.line_item?.product_id
+      ?? '',
+  ).trim();
+
+  const productTitle = String(
+    body.productTitle
+      ?? body.product_title
+      ?? body.product?.title
+      ?? body.line_item?.product_title
+      ?? '',
+  ).trim();
+
+  const customerEmail = body.customerEmail
+    ?? body.customer_email
+    ?? body.invoice?.customer_email
+    ?? body.email
+    ?? null;
+
+  const quantity = Number(body.quantity ?? body.line_item?.quantity ?? 1) || 1;
+
+  if (!productId && !productTitle) {
+    throw new Error('Missing product identifier or title in Shoppex payload');
+  }
+
+  const orderId = String(
+    body.orderId
+      ?? body.order_id
+      ?? invoiceId
+      ?? deliveryId
+      ?? '',
+  ).trim();
 
   return {
-    orderId:       body.order_id       ?? body.transaction_id ?? null,
-    productId:     body.product_id     ?? body.item_id        ?? null,
-    customerEmail: body.customer_email ?? body.email          ?? null,
-    quantity:      body.quantity        ?? 1,
+    deliveryId: deliveryId || `del_${Date.now()}`,
+    idempotencyKey: idempotencyKey || deliveryId || `idemp_${Date.now()}`,
+    orderId,
+    invoiceId,
+    productId,
+    productTitle,
+    customerEmail,
+    quantity,
+    customFields: body.customFields ?? body.custom_fields ?? body.line_item?.custom_fields ?? {},
   };
 }
 
 /**
- * Format the response that Shoppex expects after fulfillment.
+ * Format the official success response expected by Shoppex.
  *
- * TODO: Replace with the official Shoppex Dynamic Webhook response schema.
- *
- * Shoppex presumably expects the "dynamic content" (e.g. a license key,
- * download link, or account credentials) in a specific JSON shape.
- *
- * @param {object} params
- * @param {string} params.entitlementValue — the delivered content
- * @param {string} params.orderId
- * @returns {object}
+ * Official spec:
+ * Shoppex stores the nested `data` object, presenting `service_text` to the buyer
+ * and storing `dynamic_response` as the delivered asset (tokens, license codes).
  */
-export function formatShoppexResponse({ entitlementValue, orderId }) {
-  // TODO: Match the exact response schema Shoppex requires.
-  //
-  // Possible shape (UNKNOWN):
-  // {
-  //   "status": "success",
-  //   "content": entitlementValue,
-  //   "order_id": orderId,
-  // }
-
-  logger.warn('Shoppex response format uses unverified placeholder shape');
-
+export function formatShoppexSuccessResponse({ entitlementValue, orderId, serviceText }) {
   return {
+    data: {
+      service_text: serviceText || entitlementValue,
+      dynamic_response: {
+        key: entitlementValue,
+        entitlement: entitlementValue,
+      },
+      deliveryType: 'DYNAMIC',
+      count: 1,
+    },
+    // Top-level fields for backwards/universal compatibility
     status: 'success',
     content: entitlementValue,
     order_id: orderId,
@@ -118,13 +238,33 @@ export function formatShoppexResponse({ entitlementValue, orderId }) {
 }
 
 /**
- * Format an error response for Shoppex.
+ * Alias for formatShoppexSuccessResponse
+ */
+export const formatShoppexResponse = formatShoppexSuccessResponse;
+
+/**
+ * Format an out-of-stock / pending response.
  *
- * TODO: Match the exact error response schema Shoppex requires.
+ * Official spec: If fulfillment cannot be completed immediately, respond with 200
+ * and { "status": "pending" }. Shoppex marks the item as AWAITING_FULFILLMENT.
+ */
+export function formatShoppexPendingResponse(reason = 'Out of stock — awaiting replenishment') {
+  return {
+    status: 'pending',
+    data: {
+      status: 'pending',
+      message: reason,
+    },
+  };
+}
+
+/**
+ * Format an error response.
  */
 export function formatShoppexErrorResponse(message) {
   return {
     status: 'error',
+    error: message,
     message,
   };
 }

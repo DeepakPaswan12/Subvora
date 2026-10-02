@@ -428,6 +428,26 @@ describe('Health endpoint', () => {
 //  Unit tests — Shoppex service placeholders
 // ════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════
+//  Shoppex Dynamic Delivery Helper & Tests
+// ════════════════════════════════════════════════════════
+
+const SHOPPEX_TEST_SECRET = 'dynsec_0123456789abcdef0123456789abcdef';
+
+function signShoppexDelivery(rawBody, secret = SHOPPEX_TEST_SECRET, deliveryId = 'del_test_123', timestamp = null) {
+  const ts = timestamp !== null ? timestamp : Math.floor(Date.now() / 1000).toString();
+  const canonical = `${deliveryId}.${ts}.${rawBody}`;
+  const hmac = crypto.createHmac('sha256', secret).update(canonical).digest('hex');
+  return {
+    'content-type': 'application/json',
+    'x-shoppex-delivery-id': deliveryId,
+    'x-shoppex-idempotency-key': deliveryId,
+    'x-shoppex-timestamp': ts,
+    'x-shoppex-signature-v2': `v1,t=${ts},h=${hmac}`,
+    'x-shoppex-signature-v2-algorithm': 'HMAC-SHA256',
+  };
+}
+
 describe('Shoppex service', () => {
   beforeEach(() => {
     vi.resetModules();
@@ -436,12 +456,15 @@ describe('Shoppex service', () => {
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
     vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('SHOPPEX_WEBHOOK_SECRET', '');
+    vi.stubEnv('SHOPPEX_DYNAMIC_WEBHOOK_SECRET', '');
     vi.stubEnv('NODE_ENV', 'test');
   });
 
-  it('should return false when secret is not configured', async () => {
+  it('should return valid: false when secret is not configured', async () => {
     const { verifyShoppexSignature } = await import('../src/services/shoppex.service.js');
-    expect(verifyShoppexSignature('body', {})).toBe(false);
+    const result = verifyShoppexSignature('body', {});
+    expect(result.valid).toBe(false);
+    expect(result.code).toBe('SECRET_NOT_CONFIGURED');
   });
 
   it('should parse payload with fallback fields', async () => {
@@ -461,6 +484,8 @@ describe('Shoppex service', () => {
     const result = formatShoppexResponse({ entitlementValue: 'KEY-123', orderId: 'ord_1' });
     expect(result.status).toBe('success');
     expect(result.content).toBe('KEY-123');
+    expect(result.data.service_text).toBe('KEY-123');
+    expect(result.data.dynamic_response.key).toBe('KEY-123');
   });
 
   it('should format error response', async () => {
@@ -468,6 +493,459 @@ describe('Shoppex service', () => {
     const result = formatShoppexErrorResponse('Something went wrong');
     expect(result.status).toBe('error');
     expect(result.message).toBe('Something went wrong');
+  });
+});
+
+describe('Shoppex Dynamic Delivery endpoint (POST /webhooks/shoppex/delivery)', () => {
+  const MOCK_PRODUCT = {
+    id: '00000000-0000-4000-8000-000000000001',
+    name: 'Subvora Starter',
+    shoppex_product_id: 'subvora_starter',
+    active: true,
+  };
+
+  beforeEach(() => {
+    vi.resetModules();
+    vi.doUnmock('../src/services/fulfillment.service.js');
+    vi.doUnmock('../src/services/order.service.js');
+    vi.doUnmock('../src/services/inventory.service.js');
+    vi.doUnmock('../src/utils/idempotency.js');
+    vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
+    vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
+    vi.stubEnv('WHOP_API_KEY', 'whop_test');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
+    vi.stubEnv('SHOPPEX_DYNAMIC_WEBHOOK_SECRET', SHOPPEX_TEST_SECRET);
+    vi.stubEnv('NODE_ENV', 'test');
+  });
+
+  afterEach(() => {
+    vi.doUnmock('../src/services/fulfillment.service.js');
+    vi.doUnmock('../src/services/order.service.js');
+    vi.doUnmock('../src/services/inventory.service.js');
+    vi.doUnmock('../src/utils/idempotency.js');
+  });
+
+  // 1. Successful delivery
+  it('1. should complete successful delivery', async () => {
+    let capturedOrderId = null;
+    let markProcessedCalled = false;
+    let fulfillmentDelivered = false;
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: 'evt_row_1' }),
+      markEventProcessed: () => {
+        markProcessedCalled = true;
+        return Promise.resolve();
+      },
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByExternalId: () => Promise.resolve(null),
+      createOrder: ({ productId, customerEmail, externalOrderId }) => {
+        capturedOrderId = 'order_shoppex_123';
+        return Promise.resolve({
+          id: capturedOrderId,
+          product_id: productId,
+          customer_email: customerEmail,
+          external_order_id: externalOrderId,
+          status: 'paid',
+          fulfillment_status: 'pending',
+        });
+      },
+      updateOrderFulfillment: (_orderId, status) => {
+        if (status === 'delivered') fulfillmentDelivered = true;
+        return Promise.resolve({ id: _orderId, fulfillment_status: status });
+      },
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProductByShoppex: () => Promise.resolve(MOCK_PRODUCT),
+    }));
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: (_productId, _orderId) =>
+        Promise.resolve({ id: 'inv_item_1', entitlement_value: 'STARTER-LICENSE-KEY-ABC' }),
+      completeFulfillment: () => Promise.resolve(),
+      getInventoryByOrderId: () => Promise.resolve(null),
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const bodyObj = {
+      deliveryId: 'del_succ_001',
+      idempotencyKey: 'del_succ_001',
+      invoiceId: 'inv_001',
+      productId: 'subvora_starter',
+      productTitle: 'Subvora Starter',
+      customerEmail: 'buyer@example.com',
+      quantity: 1,
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, 'del_succ_001');
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(200);
+    expect(responseData.status).toBe('success');
+    expect(responseData.content).toBe('STARTER-LICENSE-KEY-ABC');
+    expect(responseData.data.service_text).toBe('STARTER-LICENSE-KEY-ABC');
+    expect(responseData.data.dynamic_response.key).toBe('STARTER-LICENSE-KEY-ABC');
+    expect(responseData.order_id).toBe('order_shoppex_123');
+    expect(markProcessedCalled).toBe(true);
+    expect(fulfillmentDelivered).toBe(true);
+  });
+
+  // 2. Invalid signature
+  it('2. should reject invalid signature with 401', async () => {
+    let reserveCalled = false;
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: () => {
+        reserveCalled = true;
+        return Promise.resolve(null);
+      },
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const bodyObj = {
+      deliveryId: 'del_bad_sig',
+      productId: 'subvora_starter',
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const headers = signShoppexDelivery(rawBody, 'wrong_secret_1234567890abcdef', 'del_bad_sig');
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(401);
+    expect(responseData.status).toBe('error');
+    expect(reserveCalled).toBe(false);
+  });
+
+  // 3. Replay / expired timestamp
+  it('3. should reject expired timestamp outside 300s window with 401', async () => {
+    let reserveCalled = false;
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: () => {
+        reserveCalled = true;
+        return Promise.resolve(null);
+      },
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const bodyObj = {
+      deliveryId: 'del_expired',
+      productId: 'subvora_starter',
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const expiredTimestamp = String(Math.floor(Date.now() / 1000) - 600); // 10 minutes old
+    const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, 'del_expired', expiredTimestamp);
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(401);
+    expect(responseData.status).toBe('error');
+    expect(responseData.message).toContain('expired');
+    expect(reserveCalled).toBe(false);
+  });
+
+  // 4. Out of stock
+  it('4. should return 200 with status: "pending" when product is out of stock', async () => {
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: () => Promise.resolve({ id: 'evt_oos' }),
+      markEventProcessed: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByExternalId: () => Promise.resolve(null),
+      createOrder: () => Promise.resolve({ id: 'order_oos' }),
+      updateOrderFulfillment: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProductByShoppex: () => Promise.resolve(MOCK_PRODUCT),
+    }));
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: () => Promise.resolve(null), // out of stock!
+      completeFulfillment: () => Promise.resolve(),
+      getInventoryByOrderId: () => Promise.resolve(null),
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const bodyObj = {
+      deliveryId: 'del_oos_001',
+      productId: 'subvora_starter',
+      customerEmail: 'buyer@example.com',
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, 'del_oos_001');
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(200);
+    expect(responseData.status).toBe('pending');
+    expect(responseData.data.status).toBe('pending');
+    expect(responseData.data.message).toContain('Out of stock');
+  });
+
+  // 5. Duplicate delivery (idempotency)
+  it('5. should return previously delivered item on duplicate delivery without consuming new inventory', async () => {
+    let reserveCallCount = 0;
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByExternalId: (key) => {
+        if (key === 'del_dup_001') {
+          return Promise.resolve({
+            id: 'order_existing_123',
+            fulfillment_status: 'delivered',
+          });
+        }
+        return Promise.resolve(null);
+      },
+      createOrder: () => Promise.resolve({ id: 'order_dup' }),
+      updateOrderFulfillment: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      getInventoryByOrderId: (orderId) => {
+        if (orderId === 'order_existing_123') {
+          return Promise.resolve({
+            id: 'inv_prev_item',
+            entitlement_value: 'PREVIOUS-DELIVERED-KEY-XYZ',
+            status: 'delivered',
+          });
+        }
+        return Promise.resolve(null);
+      },
+      reserveInventory: () => {
+        reserveCallCount++;
+        return Promise.resolve({ id: 'inv_new', entitlement_value: 'NEW-KEY-SHOULD-NOT-BE-DELIVERED' });
+      },
+      completeFulfillment: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve({ id: 'evt_dup', processed: true }),
+      recordEvent: () => Promise.resolve(null),
+      markEventProcessed: () => Promise.resolve(),
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const bodyObj = {
+      deliveryId: 'del_dup_001',
+      idempotencyKey: 'del_dup_001',
+      productId: 'subvora_starter',
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, 'del_dup_001');
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(200);
+    expect(responseData.status).toBe('success');
+    expect(responseData.content).toBe('PREVIOUS-DELIVERED-KEY-XYZ');
+    expect(responseData.data.dynamic_response.key).toBe('PREVIOUS-DELIVERED-KEY-XYZ');
+    // Ensure reserveInventory was NOT called!
+    expect(reserveCallCount).toBe(0);
+  });
+
+  // 6. Concurrent delivery
+  it('6. should atomically reserve distinct inventory items for concurrent delivery requests', async () => {
+    // Inventory pool simulating atomic reservation with FOR UPDATE SKIP LOCKED
+    const inventoryPool = [
+      { id: 'inv_row_1', entitlement_value: 'CONCURRENT-KEY-1', reserved: false },
+      { id: 'inv_row_2', entitlement_value: 'CONCURRENT-KEY-2', reserved: false },
+    ];
+
+    vi.doMock('../src/utils/idempotency.js', () => ({
+      findEvent: () => Promise.resolve(null),
+      recordEvent: (_prov, key) => Promise.resolve({ id: `evt_${key}` }),
+      markEventProcessed: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/services/order.service.js', () => ({
+      findOrderByExternalId: () => Promise.resolve(null),
+      createOrder: ({ externalOrderId }) =>
+        Promise.resolve({ id: `order_${externalOrderId}`, external_order_id: externalOrderId }),
+      updateOrderFulfillment: () => Promise.resolve(),
+    }));
+
+    vi.doMock('../src/services/fulfillment.service.js', () => ({
+      findSubvoraProductByShoppex: () => Promise.resolve(MOCK_PRODUCT),
+    }));
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: async () => {
+        // Atomic pick next available item
+        const item = inventoryPool.find((i) => !i.reserved);
+        if (item) {
+          item.reserved = true;
+          return { id: item.id, entitlement_value: item.entitlement_value };
+        }
+        return null;
+      },
+      completeFulfillment: () => Promise.resolve(),
+      getInventoryByOrderId: () => Promise.resolve(null),
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    const makeDeliveryRequest = async (deliveryId) => {
+      const bodyObj = {
+        deliveryId,
+        idempotencyKey: deliveryId,
+        productId: 'subvora_starter',
+        productTitle: 'Subvora Starter',
+      };
+      const rawBody = JSON.stringify(bodyObj);
+      const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, deliveryId);
+
+      let statusCode = 200;
+      let responseData = null;
+      const res = {
+        status: (c) => {
+          statusCode = c;
+          return res;
+        },
+        json: (d) => {
+          responseData = d;
+          return res;
+        },
+      };
+
+      await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+      return { statusCode, responseData };
+    };
+
+    // Run both requests concurrently
+    const [result1, result2] = await Promise.all([
+      makeDeliveryRequest('del_conc_1'),
+      makeDeliveryRequest('del_conc_2'),
+    ]);
+
+    expect(result1.statusCode).toBe(200);
+    expect(result2.statusCode).toBe(200);
+
+    const key1 = result1.responseData.content;
+    const key2 = result2.responseData.content;
+
+    // Both must be valid keys from the pool and distinctly separate
+    expect(['CONCURRENT-KEY-1', 'CONCURRENT-KEY-2']).toContain(key1);
+    expect(['CONCURRENT-KEY-1', 'CONCURRENT-KEY-2']).toContain(key2);
+    expect(key1).not.toBe(key2);
+  });
+
+  // 7. Malformed payload
+  it('7. should reject malformed payload with 400', async () => {
+    let reserveCalled = false;
+
+    vi.doMock('../src/services/inventory.service.js', () => ({
+      reserveInventory: () => {
+        reserveCalled = true;
+        return Promise.resolve(null);
+      },
+    }));
+
+    const { handleShoppexDeliveryWebhook } = await import('../src/controllers/shoppex.controller.js');
+
+    // Missing productId and productTitle
+    const bodyObj = {
+      deliveryId: 'del_no_product',
+      somethingElse: 'unrecognized',
+    };
+    const rawBody = JSON.stringify(bodyObj);
+    const headers = signShoppexDelivery(rawBody, SHOPPEX_TEST_SECRET, 'del_no_product');
+
+    let statusCode = 200;
+    let responseData = null;
+    const res = {
+      status: (c) => {
+        statusCode = c;
+        return res;
+      },
+      json: (d) => {
+        responseData = d;
+        return res;
+      },
+    };
+
+    await handleShoppexDeliveryWebhook({ rawBody, headers, body: bodyObj }, res);
+
+    expect(statusCode).toBe(400);
+    expect(responseData.status).toBe('error');
+    expect(reserveCalled).toBe(false);
   });
 });
 
@@ -537,6 +1015,10 @@ describe('Product mapping — findSubvoraProduct', () => {
 
   beforeEach(() => {
     vi.resetModules();
+    vi.doUnmock('../src/services/fulfillment.service.js');
+    vi.doUnmock('../src/services/order.service.js');
+    vi.doUnmock('../src/services/inventory.service.js');
+    vi.doUnmock('../src/utils/idempotency.js');
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');

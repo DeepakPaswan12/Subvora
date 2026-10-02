@@ -14,9 +14,10 @@ const envSchema = z.object({
   WHOP_API_KEY:             z.string().min(1),
   WHOP_WEBHOOK_SECRET:      z.string().min(1),
 
-  SHOPPEX_WEBHOOK_SECRET:   z.string().default(''),
+  SHOPPEX_WEBHOOK_SECRET:         z.string().default(''),
+  SHOPPEX_DYNAMIC_WEBHOOK_SECRET: z.string().default(''),
 
-  CORS_ORIGIN:              z.string().default('http://localhost:5173'),
+  CORS_ORIGIN:                    z.string().default('http://localhost:5173'),
 });
 
 // ── Parse & freeze ─────────────────────────────────────

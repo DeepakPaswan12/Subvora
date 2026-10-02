@@ -90,20 +90,64 @@ export async function findSubvoraProduct({ whopProductId, whopPlanId }) {
 }
 
 /**
- * Look up the internal Subvora product by Shoppex product ID.
+ * Look up the internal Subvora product by Shoppex product ID or title.
+ *
+ * Matching priority:
+ *   1. products.shoppex_product_id
+ *   2. products.id (if identifier is a valid UUID)
+ *   3. products.name (case-insensitive match using title or identifier)
+ *
+ * @param {string|object} identifierOrOptions
+ * @param {string} [fallbackTitle]
+ * @returns {Promise<object|null>}
  */
-export async function findSubvoraProductByShoppex(shoppexProductId) {
-  const { data, error } = await supabase
-    .from('products')
-    .select('id, name, active, shoppex_product_id')
-    .eq('shoppex_product_id', shoppexProductId)
-    .eq('active', true)
-    .maybeSingle();
+export async function findSubvoraProductByShoppex(identifierOrOptions, fallbackTitle) {
+  let shoppexId = typeof identifierOrOptions === 'string'
+    ? identifierOrOptions
+    : identifierOrOptions?.shoppexProductId || identifierOrOptions?.productId;
+  let title = typeof identifierOrOptions === 'object'
+    ? identifierOrOptions?.productTitle || identifierOrOptions?.title
+    : fallbackTitle;
 
-  if (error) {
-    logger.error({ err: error, shoppexProductId }, 'Failed to look up Subvora product by Shoppex ID');
-    throw error;
+  // 1. Try by shoppex_product_id
+  if (shoppexId) {
+    const { data, error } = await supabase
+      .from('products')
+      .select('id, name, active, shoppex_product_id')
+      .eq('shoppex_product_id', shoppexId)
+      .eq('active', true)
+      .maybeSingle();
+
+    if (error) {
+      logger.error({ err: error, shoppexId }, 'Failed to look up Subvora product by Shoppex ID');
+      throw error;
+    }
+    if (data) return data;
   }
 
-  return data;
+  // 2. Try by UUID if shoppexId is a valid UUID
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (shoppexId && uuidRegex.test(shoppexId)) {
+    const { data } = await supabase
+      .from('products')
+      .select('id, name, active, shoppex_product_id')
+      .eq('id', shoppexId)
+      .eq('active', true)
+      .maybeSingle();
+    if (data) return data;
+  }
+
+  // 3. Try by case-insensitive name / title
+  const searchTitle = title || shoppexId;
+  if (searchTitle) {
+    const { data } = await supabase
+      .from('products')
+      .select('id, name, active, shoppex_product_id')
+      .ilike('name', searchTitle.trim())
+      .eq('active', true)
+      .maybeSingle();
+    if (data) return data;
+  }
+
+  return null;
 }
