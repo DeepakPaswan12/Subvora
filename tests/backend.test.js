@@ -26,15 +26,17 @@ async function buildTestApp() {
 
 /**
  * Create a valid Whop webhook signature for testing.
+ *
+ * Matches the official Whop signing algorithm:
+ *   - Key: the raw ws_ secret string as UTF-8 bytes
+ *   - Signed content: "${msgId}.${timestamp}.${rawBody}"
+ *   - Signature: "v1," + base64(HMAC-SHA256)
  */
 function signWebhook(rawBody, secret, msgId = 'msg_test123', timestamp = null) {
   const ts = timestamp || Math.floor(Date.now() / 1000).toString();
-  const secretBytes = Buffer.from(
-    secret.startsWith('whsec_') ? secret.slice(6) : secret,
-    'base64',
-  );
+  const secretKey = Buffer.from(secret, 'utf-8');
   const signedContent = `${msgId}.${ts}.${rawBody}`;
-  const sig = crypto.createHmac('sha256', secretBytes).update(signedContent).digest('base64');
+  const sig = crypto.createHmac('sha256', secretKey).update(signedContent).digest('base64');
   return {
     'webhook-id': msgId,
     'webhook-timestamp': ts,
@@ -47,7 +49,8 @@ function signWebhook(rawBody, secret, msgId = 'msg_test123', timestamp = null) {
 // ════════════════════════════════════════════════════════
 
 describe('Whop webhook signature verification', () => {
-  const TEST_SECRET = 'whsec_' + Buffer.from('test-secret-key-32bytes!').toString('base64');
+  // Whop secrets use ws_ prefix with a hex string — NOT whsec_ / base64
+  const TEST_SECRET = 'ws_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
 
   beforeEach(() => {
     vi.resetModules();
@@ -76,7 +79,7 @@ describe('Whop webhook signature verification', () => {
     const headers = signWebhook(body, TEST_SECRET);
     headers['webhook-signature'] = 'v1,invalidsignaturevalue';
 
-    expect(() => verifyWebhook(body, headers)).toThrow();
+    expect(() => verifyWebhook(body, headers)).toThrow('Invalid webhook signature');
   });
 
   it('should reject missing headers', async () => {
@@ -94,6 +97,57 @@ describe('Whop webhook signature verification', () => {
 
     expect(() => verifyWebhook(body, headers)).toThrow('Webhook timestamp too old');
   });
+
+  it('should reject a modified payload (body tampered after signing)', async () => {
+    const { verifyWebhook } = await import('../src/services/whop.service.js');
+    const originalBody = JSON.stringify({ type: 'payment.succeeded', data: { id: 'pay_123' } });
+    const headers = signWebhook(originalBody, TEST_SECRET);
+
+    // Tamper with the body after signing
+    const tamperedBody = JSON.stringify({ type: 'payment.succeeded', data: { id: 'pay_EVIL' } });
+
+    expect(() => verifyWebhook(tamperedBody, headers)).toThrow('Invalid webhook signature');
+  });
+
+  it('should reject when webhook-signature header is missing', async () => {
+    const { verifyWebhook } = await import('../src/services/whop.service.js');
+    const body = JSON.stringify({ type: 'payment.succeeded' });
+
+    const headers = {
+      'webhook-id': 'msg_test123',
+      'webhook-timestamp': Math.floor(Date.now() / 1000).toString(),
+      // webhook-signature intentionally omitted
+    };
+
+    expect(() => verifyWebhook(body, headers)).toThrow('Missing required webhook headers');
+  });
+
+  it('should use the raw ws_ secret without stripping prefix or decoding', async () => {
+    // This test ensures the key derivation matches Whop's official spec:
+    // the ws_ string is used as-is as the HMAC key.
+    const { verifyWebhook } = await import('../src/services/whop.service.js');
+    const body = JSON.stringify({ type: 'membership.activated', data: { id: 'mem_abc' } });
+    const msgId = 'msg_rawkeytest';
+    const ts = Math.floor(Date.now() / 1000).toString();
+
+    // Manually compute the expected signature using the raw secret
+    const signedContent = `${msgId}.${ts}.${body}`;
+    const expectedSig = crypto
+      .createHmac('sha256', Buffer.from(TEST_SECRET, 'utf-8'))
+      .update(signedContent)
+      .digest('base64');
+
+    const headers = {
+      'webhook-id': msgId,
+      'webhook-timestamp': ts,
+      'webhook-signature': `v1,${expectedSig}`,
+    };
+
+    const result = verifyWebhook(body, headers);
+    expect(result).toBeDefined();
+    expect(result.id).toBe(msgId);
+    expect(result.payload.type).toBe('membership.activated');
+  });
 });
 
 // ════════════════════════════════════════════════════════
@@ -106,7 +160,7 @@ describe('Idempotency utilities', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('NODE_ENV', 'test');
   });
 
@@ -166,7 +220,7 @@ describe('Order service — getOrderById', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('NODE_ENV', 'test');
   });
 
@@ -234,7 +288,7 @@ describe('Inventory service', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('NODE_ENV', 'test');
   });
 
@@ -313,7 +367,7 @@ describe('SUPPORTED_EVENTS', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('NODE_ENV', 'test');
   });
 
@@ -380,7 +434,7 @@ describe('Shoppex service', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('SHOPPEX_WEBHOOK_SECRET', '');
     vi.stubEnv('NODE_ENV', 'test');
   });
@@ -427,7 +481,7 @@ describe('Error middleware', () => {
     vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co');
     vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-key');
     vi.stubEnv('WHOP_API_KEY', 'whop_test');
-    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'whsec_dGVzdA==');
+    vi.stubEnv('WHOP_WEBHOOK_SECRET', 'ws_test_secret_for_unit_tests');
     vi.stubEnv('NODE_ENV', 'production');
   });
 

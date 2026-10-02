@@ -81,7 +81,7 @@ Fill in the values:
 | `SUPABASE_URL`            | Your Supabase project URL                      |
 | `SUPABASE_SERVICE_ROLE_KEY` | Service-role key from Supabase dashboard     |
 | `WHOP_API_KEY`            | Your Whop API key (starts with `whop_`)        |
-| `WHOP_WEBHOOK_SECRET`     | Webhook signing secret (starts with `whsec_`)  |
+| `WHOP_WEBHOOK_SECRET`     | Webhook signing secret (starts with `ws_`)     |
 | `SHOPPEX_WEBHOOK_SECRET`  | Shoppex webhook secret (when available)        |
 | `CORS_ORIGIN`             | Frontend origin URL                            |
 

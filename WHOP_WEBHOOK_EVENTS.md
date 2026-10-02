@@ -48,8 +48,9 @@ Whop uses the **Standard Webhooks** specification:
   ```
 
 - **Key derivation:**
-  The secret from the dashboard (e.g. `whsec_abc123...`) has a `whsec_` prefix.
-  The actual HMAC key is `base64decode(secret_without_prefix)`.
+  The secret from the dashboard (e.g. `ws_0123456789abcdef...`) has a `ws_` prefix.
+  The HMAC key is the **raw secret string itself** used as UTF-8 bytes.
+  Do NOT strip the prefix. Do NOT base64-decode it.
 
 - **Replay protection:**
   The backend rejects events where `|now - webhook-timestamp| > 300 seconds`.
@@ -58,7 +59,7 @@ Whop uses the **Standard Webhooks** specification:
 
 1. Go to **Whop Dashboard → Developer → Webhooks**.
 2. Create or select your webhook endpoint.
-3. Copy the signing secret (starts with `whsec_`).
+3. Copy the signing secret (starts with `ws_`).
 4. Set it as `WHOP_WEBHOOK_SECRET` in your `.env` / Render env vars.
 
 ## Additional events you may want

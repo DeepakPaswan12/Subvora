@@ -44,16 +44,28 @@ export const SUPPORTED_EVENTS = Object.freeze({
 //  Webhook signature verification
 // ════════════════════════════════════════════════════════
 
+// Log whether the webhook secret is configured (never log the value)
+logger.info(
+  { configured: Boolean(env.WHOP_WEBHOOK_SECRET) },
+  'WHOP_WEBHOOK_SECRET environment variable status',
+);
+
 /**
  * Verify an incoming Whop webhook using the Standard Webhooks spec.
  *
+ * Official documentation: https://docs.whop.com/developer/guides/webhooks
+ *
  * Whop sends three headers with every webhook delivery:
- *   - webhook-id        — unique event ID
+ *   - webhook-id        — unique event ID (e.g. "msg_bQPHmO2eBnHYtWWuxAN9K3Xd")
  *   - webhook-timestamp — UNIX seconds when the message was sent
  *   - webhook-signature — "v1,<base64(HMAC-SHA256)>"
  *
- * The signing input is: "${webhook-id}.${webhook-timestamp}.${rawBody}"
- * The key is the base64-decoded portion of the secret after the "whsec_" prefix.
+ * Signed content: "${webhook-id}.${webhook-timestamp}.${rawBody}"
+ *
+ * IMPORTANT — Key format (from official Whop docs):
+ *   The secret is a `ws_` prefixed hex string (e.g. ws_0123456789abcdef...).
+ *   The HMAC key is the raw secret string itself. Do NOT strip the prefix.
+ *   Do NOT base64-decode it. Pass it to HMAC exactly as Whop gave it.
  *
  * @param {string|Buffer} rawBody    — the raw, unparsed request body
  * @param {object}        headers    — the full request headers
@@ -82,30 +94,39 @@ export function verifyWebhook(rawBody, headers) {
     throw err;
   }
 
-  // ── Derive signing key ──
+  // ── Derive signing key ──────────────────────────────────────
+  // From Whop docs: "pass it to the helper exactly as Whop gave
+  // it to you — a ws_ string. Don't strip the prefix, and don't
+  // base64-encode it. The helper derives the key."
+  //
+  // The raw secret string IS the HMAC key.
   const secret = env.WHOP_WEBHOOK_SECRET;
-  // Standard Webhooks secrets start with "whsec_"; the actual key is the rest, base64-encoded
-  const secretBytes = Buffer.from(
-    secret.startsWith('whsec_') ? secret.slice(6) : secret,
-    'base64',
-  );
+  const secretKey = Buffer.from(secret, 'utf-8');
 
   // ── Compute expected signature ──
-  const signedContent = `${msgId}.${msgTs}.${rawBody}`;
-  const expected = crypto
-    .createHmac('sha256', secretBytes)
+  const rawBodyStr = typeof rawBody === 'string' ? rawBody : rawBody.toString('utf-8');
+  const signedContent = `${msgId}.${msgTs}.${rawBodyStr}`;
+  const expectedSig = crypto
+    .createHmac('sha256', secretKey)
     .update(signedContent)
     .digest('base64');
 
   // ── Compare against all provided v1 signatures ──
+  // The webhook-signature header may contain multiple space-separated
+  // signatures (e.g. during key rotation). Match any one.
+  const expectedBuf = Buffer.from(expectedSig, 'utf-8');
   const signatures = msgSig.split(' ');
   const verified = signatures.some((sig) => {
-    const [version, value] = sig.split(',');
+    const commaIdx = sig.indexOf(',');
+    if (commaIdx === -1) return false;
+    const version = sig.slice(0, commaIdx);
+    const value   = sig.slice(commaIdx + 1);
     if (version !== 'v1' || !value) return false;
-    return crypto.timingSafeEqual(
-      Buffer.from(expected),
-      Buffer.from(value),
-    );
+
+    // timingSafeEqual throws if buffer lengths differ — guard against it
+    const valueBuf = Buffer.from(value, 'utf-8');
+    if (expectedBuf.length !== valueBuf.length) return false;
+    return crypto.timingSafeEqual(expectedBuf, valueBuf);
   });
 
   if (!verified) {
@@ -115,7 +136,7 @@ export function verifyWebhook(rawBody, headers) {
     throw err;
   }
 
-  const payload = typeof rawBody === 'string' ? JSON.parse(rawBody) : JSON.parse(rawBody.toString());
+  const payload = JSON.parse(rawBodyStr);
 
   return { id: msgId, timestamp: Number(msgTs), payload };
 }
